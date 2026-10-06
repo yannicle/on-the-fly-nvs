@@ -12,6 +12,7 @@
 import cv2
 import json
 import time
+import traceback
 import torch
 from utils import fov2focal, focal2fov
 from threading import Thread
@@ -49,6 +50,14 @@ class WebViewer:
         print("Client connected.")
         self.num_clients += 1
         self.state = "stop"
+        try:
+            self.serve_client(websocket)
+        finally:
+            # Always free the slot, otherwise every reconnection waits forever
+            self.num_clients -= 1
+
+    def serve_client(self, websocket: ServerConnection):
+        render_failed = False
         while True:
             try:
                 try:
@@ -99,13 +108,21 @@ class WebViewer:
                 pose = pose.transpose(0, 1) # CM,W2C
 
                 # Render image and send it to client
-                render_pkg = self.scene_model.render(res_x, res_y, pose, 1, fov_x=fov_x, fov_y=fov_y)
-                image = render_pkg["render"]
-                image = image.clamp(0, 1.0).mul(255).permute(1, 2, 0).byte().detach().cpu().numpy()
+                # A failed render (e.g. while the scene is still empty) must not stop the start/stop state exchange
+                try:
+                    render_pkg = self.scene_model.render(res_x, res_y, pose, 1, fov_x=fov_x, fov_y=fov_y)
+                    image = render_pkg["render"]
+                    image = image.clamp(0, 1.0).mul(255).permute(1, 2, 0).byte().detach().cpu().numpy()
+                    render_failed = False
+                except Exception:
+                    if not render_failed:
+                        traceback.print_exc()
+                    render_failed = True
+                    time.sleep(0.1)
+                    continue
 
                 _, buffer = cv2.imencode(".jpg", cv2.cvtColor(image, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 50])
                 websocket.send(buffer.tobytes())
             except ConnectionClosed:
                 print("Client disconnected.")
-                self.num_clients -= 1
                 break

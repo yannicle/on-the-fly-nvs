@@ -30,10 +30,9 @@ from scene.dense_extractor import DenseExtractor
 from scene.keyframe import Keyframe
 from scene.mono_depth import MonoDepthEstimator
 from scene.scene_model import SceneModel
-from gaussianviewer import GaussianViewer
 from webviewer.webviewer import WebViewer
-from graphdecoviewer.types import ViewerMode
 from utils import align_mean_up_fwd, increment_runtime
+from unreal_stream import UnrealStreamer
 
 if __name__ == "__main__":
     torch.random.manual_seed(0)
@@ -44,12 +43,17 @@ if __name__ == "__main__":
 
     # Initialize dataloader
     if "://" in args.source_path:
-        dataset = StreamDataset(args.source_path, args.downsampling)
+        dataset = StreamDataset(args.source_path, args.downsampling, undistort=args.undistort,
+                                undistort_fov_scale=args.undistort_fov_scale, equirect=args.equirect)
         is_stream = True
     else:
         dataset = ImageDataset(args)
         is_stream = False
     height, width = dataset.get_image_size()
+    # Undistorted and equirectangular streams have a known focal, so use it instead of estimating one
+    if is_stream and dataset.focal is not None and args.init_focal <= 0:
+        args.init_focal = dataset.focal
+        args.fix_focal = True
 
     # Initialize other modules
     print("Initializing modules and running just in time compilation, may take a while...")
@@ -70,6 +74,9 @@ if __name__ == "__main__":
 
     # Initialize the viewer
     if args.viewer_mode in ["server", "local"]:
+        # Imported here so the other viewer modes work without the native imgui libraries
+        from gaussianviewer import GaussianViewer
+        from graphdecoviewer.types import ViewerMode
         viewer_mode = ViewerMode.SERVER if args.viewer_mode == "server" else ViewerMode.LOCAL
         viewer = GaussianViewer.from_scene_model(scene_model, viewer_mode)
         viewer_thd = Thread(target=viewer.run, args=(args.ip, args.port), daemon=True)
@@ -85,6 +92,52 @@ if __name__ == "__main__":
         viewer = WebViewer(scene_model, args.ip, args.port)
         viewer_thd = Thread(target=viewer.run, daemon=True)
         viewer_thd.start()
+
+    # Stream the reconstruction to Unreal while it is built
+    unreal_streamer = None
+    if args.unreal_stream:
+        unreal_streamer = UnrealStreamer(
+            scene_model, args.unreal_stream, args.unreal_stream_interval,
+            args.unreal_unit_scale, args.unreal_min_opacity,
+        ).start()
+
+    # 360 streams: only view 0 is tracked, the other views of a frame share its centre with a fixed rotation
+    is_rig = is_stream and args.equirect is not None and args.equirect[2] > 1
+    n_mvs_cams = args.num_prev_keyframes_miniba_incr
+
+    def add_rig_views(parent, rig_views, f):
+        """Adds the other views of parent's 360 frame as keyframes tied to parent. Returns them."""
+        keyframes = []
+        for view_id, (view_image, rig_rot) in enumerate(rig_views, 1):
+            keyframe = Keyframe(
+                view_image,
+                {"is_test": False, "view_id": view_id},
+                detector(view_image),
+                None,
+                len(scene_model.keyframes),
+                f,
+                dense_extractor,
+                depth_estimator,
+                triangulator,
+                args,
+                rig_parent=parent,
+                rig_rot=rig_rot,
+            )
+            scene_model.add_keyframe(keyframe)
+            keyframes.append(keyframe)
+        return keyframes
+
+    def match_rig_view(keyframe):
+        """Matches a rig view with nearby views of other frames, which have the baseline to triangulate its keypoints."""
+        for other in scene_model.get_rig_neighbours(keyframe, n_mvs_cams):
+            matcher(keyframe.desc_kpts, other.desc_kpts, remove_outliers=True, update_kpts_flag="all",
+                    kID=keyframe.index, kID_other=other.index)
+
+    def add_new_gaussians(keyframe):
+        if is_rig:
+            scene_model.add_new_gaussians(keyframe.index, scene_model.get_rig_neighbours(keyframe, n_mvs_cams))
+        else:
+            scene_model.add_new_gaussians(keyframe.index)
 
     n_active_keyframes = 0
     n_keyframes = 0
@@ -153,10 +206,12 @@ if __name__ == "__main__":
                 Rts, f, _ = pose_initializer.initialize_bootstrap(bootstrap_desc_kpts)
                 focal = f.cpu().item()
                 increment_runtime(runtimes["BAB"], start_time)
+                bootstrap_rig_views = []
                 for index, (keyframe_dict, desc_kpts, Rt) in enumerate(
                     zip(bootstrap_keyframe_dicts, bootstrap_desc_kpts, Rts)
                 ):
                     start_time = time.time()
+                    bootstrap_rig_views.append(keyframe_dict["info"].pop("rig_views", []))
                     if args.use_colmap_poses:
                         Rt = keyframe_dict["info"]["Rt"]
                         f = keyframe_dict["info"]["focal"]
@@ -177,9 +232,20 @@ if __name__ == "__main__":
                 if args.viewer_mode not in ["none", "web"]:
                     viewer.reset_intrinsics("point_view")
                 prev_keyframe = keyframe
-                for index in range(args.num_keyframes_miniba_bootstrap):
+                new_keyframes = scene_model.keyframes[: args.num_keyframes_miniba_bootstrap]
+                if is_rig:
+                    # Add every rig view first so they can be matched with the views of all bootstrap frames
                     start_time = time.time()
-                    scene_model.add_new_gaussians(index)
+                    rig_keyframes = []
+                    for parent, rig_views in zip(list(new_keyframes), bootstrap_rig_views):
+                        rig_keyframes += add_rig_views(parent, rig_views, f)
+                    for keyframe in rig_keyframes:
+                        match_rig_view(keyframe)
+                    new_keyframes = new_keyframes + rig_keyframes
+                    increment_runtime(runtimes["Add"], start_time)
+                for keyframe in new_keyframes:
+                    start_time = time.time()
+                    add_new_gaussians(keyframe)
                     increment_runtime(runtimes["Init"], start_time)
                 start_time = time.time()
                 # Run initial optimization on the bootstrap keyframes
@@ -194,6 +260,7 @@ if __name__ == "__main__":
             ## Reboot
             if (
                 args.enable_reboot
+                and not is_rig
                 and scene_model.approx_cam_centres is not None
                 and len(scene_model.anchors)
             ):
@@ -237,19 +304,20 @@ if __name__ == "__main__":
                 increment_runtime(runtimes["tri"], start_time)
                 start_time = time.time()
                 Rt = pose_initializer.initialize_incremental(
-                    prev_keyframes, desc_kpts, n_keyframes, info["is_test"], image
+                    prev_keyframes, desc_kpts, len(scene_model.keyframes), info["is_test"], image
                 )
                 increment_runtime(runtimes["BAI"], start_time)
                 start_time = time.time()
                 if Rt is not None:
                     if args.use_colmap_poses:
                         Rt = info["Rt"]
+                    rig_views = info.pop("rig_views", [])
                     keyframe = Keyframe(
                         image,
                         info,
                         desc_kpts,
                         Rt,
-                        n_keyframes,
+                        len(scene_model.keyframes),
                         f,
                         dense_extractor,
                         depth_estimator,
@@ -258,10 +326,17 @@ if __name__ == "__main__":
                     )
                     scene_model.add_keyframe(keyframe)
                     prev_keyframe = keyframe
+                    new_keyframes = [keyframe]
+                    if is_rig:
+                        rig_keyframes = add_rig_views(keyframe, rig_views, f)
+                        for rig_keyframe in rig_keyframes:
+                            match_rig_view(rig_keyframe)
+                        new_keyframes += rig_keyframes
                     increment_runtime(runtimes["Add"], start_time)
                     # Gaussian initialization
                     start_time = time.time()
-                    scene_model.add_new_gaussians()
+                    for new_keyframe in new_keyframes:
+                        add_new_gaussians(new_keyframe)
                     increment_runtime(runtimes["Init"], start_time)
                     start_time = time.time()
                     # If streaming, run async optimization until the next keyframe is added
@@ -322,6 +397,10 @@ if __name__ == "__main__":
 
     # Set to inference mode so that the model can be rendered properly
     scene_model.enable_inference_mode()
+
+    # Send the finished reconstruction once more, flagged as final
+    if unreal_streamer is not None:
+        unreal_streamer.stop(send_final=True)
 
     # Save the model and metrics
     print("Saving the reconstruction to:", args.model_path)

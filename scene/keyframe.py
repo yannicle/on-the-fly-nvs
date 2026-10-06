@@ -40,7 +40,24 @@ class Keyframe:
         triangulator: Triangulator,
         args: Namespace,
         inference_mode: bool = False,
+        rig_parent: Keyframe = None,
+        rig_rot: torch.Tensor = None,
     ):
+        """
+        rig_parent and rig_rot make this a view of a multi-camera rig (e.g. a 360 camera cut into several views):
+        it shares the parent's centre and its orientation is fixed to rig_rot @ parent orientation,
+        so it has no pose of its own and Rt is ignored.
+        """
+        self.rig_parent = rig_parent
+        self.rig_rot = rig_rot
+        self.rig_children = []
+        if rig_parent is not None:
+            Rt = torch.eye(4, device="cuda")
+            Rt[:3, :3] = rig_rot @ rig_parent.get_R().detach()
+            Rt[:3, 3] = rig_rot @ rig_parent.get_t().detach()
+            rig_parent.rig_children.append(index)
+        self.rig_id = rig_parent.index if rig_parent is not None else index
+        self.view_id = info.get("view_id", 0)
         self.image_pyr = [image]
         if not inference_mode: # Only extract depth and feature maps in training mode
             self.feat_map = feat_extractor(image)
@@ -86,8 +103,6 @@ class Keyframe:
         # Optimizer
         if not inference_mode: # Only create optimizer in training mode
             params = {
-                "rW2C": {"val": self.rW2C, "lr": args.lr_poses},
-                "tW2C": {"val": self.tW2C, "lr": args.lr_poses},
                 "depth_scale": {
                     "val": self.depth_scale,
                     "lr": args.lr_depth_scale_offset,
@@ -97,6 +112,10 @@ class Keyframe:
                     "lr": args.lr_depth_scale_offset,
                 },
             }
+            # Rig views follow their parent's pose
+            if rig_parent is None:
+                params["rW2C"] = {"val": self.rW2C, "lr": args.lr_poses}
+                params["tW2C"] = {"val": self.tW2C, "lr": args.lr_poses}
             if not info["is_test"]:
                 params["exposure"] = {"val": self.exposure, "lr": args.lr_exposure}
             self.optimizer = BaseAdam(params, betas=(0.8, 0.99))
@@ -124,9 +143,13 @@ class Keyframe:
         return self.image_pyr[0].device
 
     def get_R(self):
+        if self.rig_parent is not None:
+            return self.rig_rot @ self.rig_parent.get_R()
         return sixD2mtx(self.rW2C)
 
     def get_t(self):
+        if self.rig_parent is not None:
+            return self.rig_rot @ self.rig_parent.get_t()
         return self.tW2C
 
     def get_Rt(self):
@@ -136,6 +159,7 @@ class Keyframe:
         return Rt
 
     def set_Rt(self, Rt: torch.Tensor):
+        assert self.rig_parent is None, "Rig views follow their parent, set the parent's pose instead"
         self.rW2C.data.copy_(Rt[:3, :2])
         self.tW2C.data.copy_(Rt[:3, 3])
 

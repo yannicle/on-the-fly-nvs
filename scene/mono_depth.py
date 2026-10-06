@@ -22,6 +22,15 @@ sys.path.append("submodules/Depth-Anything-V2")
 os.environ["XFORMERS_FORCE_DISABLE_TRITON"] = "1"
 from depth_anything_v2.dpt import DepthAnythingV2
 
+# xformers picks its Hopper-only FlashAttention-3 kernels on any GPU >= sm90, which fails on
+# Blackwell (e.g. RTX 50xx) with "invalid argument". Fall back to its other kernels there.
+try:
+    from xformers.ops.fmha import dispatch as xformers_dispatch
+    if torch.cuda.get_device_capability()[0] != 9:
+        xformers_dispatch._set_use_fa3(False)
+except ImportError:
+    pass
+
 size = 518
 encoder = "vitl"
 

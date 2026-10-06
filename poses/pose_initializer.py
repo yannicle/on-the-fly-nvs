@@ -217,8 +217,10 @@ class PoseInitializer():
             match_indices = match_indices[selected_indices]
 
         # Estimate an initial camera pose and inliers using PnP RANSAC
-        Rs6D_init = keyframes[0].rW2C
-        ts_init = keyframes[0].tW2C
+        # Read the pose through get_Rt, as rig views have no pose parameters of their own
+        Rt_init = keyframes[0].get_Rt()
+        Rs6D_init = Rt_init[:3, :2].contiguous()
+        ts_init = Rt_init[:3, 3].contiguous()
         Rt, inliers = self.PnPRANSAC(uvs, xyz, self.f, self.centre, Rs6D_init, ts_init, confs)
 
         xyz = xyz[inliers]

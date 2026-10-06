@@ -149,6 +149,9 @@ class SceneModel:
         self.init_intrinsics()
 
         self.approx_cam_centres = None
+        # Rig frame and view of each keyframe, see Keyframe
+        self.kf_rig_ids = torch.zeros(0, dtype=torch.long, device="cuda")
+        self.kf_view_ids = torch.zeros(0, dtype=torch.long, device="cuda")
         self.gt_Rts = torch.empty(0, 4, 4, device="cuda")
         self.gt_Rts_mask = torch.empty(0, device="cuda", dtype=bool)
         self.gt_f = self.f
@@ -324,6 +327,9 @@ class SceneModel:
             keyframe.latest_invdepth = render_pkg["invdepth"].detach()
 
         self.valid_Rt_cache[keyframe_id] = False
+        # Rig views move with their parent
+        for child_id in keyframe.rig_children:
+            self.valid_Rt_cache[child_id] = False
         self.last_trained_id = keyframe_id
 
     def optimization_loop(self, n_iters: int, run_until_interupt: bool = False):
@@ -602,6 +608,23 @@ class SceneModel:
                 keyframe.update_3dpts(self.keyframes)
         return prev_keyframes
 
+    @torch.no_grad()
+    def get_rig_neighbours(self, keyframe: Keyframe, n: int):
+        """
+        Closest keyframes from other rig frames, those looking the same way as keyframe first.
+        Views of the same rig frame share its centre, so they are useless for triangulation and stereo.
+        """
+        if self.approx_cam_centres is None:
+            return []
+        dists = torch.linalg.vector_norm(self.approx_cam_centres - keyframe.approx_centre[None], dim=-1)
+        same_rig = self.kf_rig_ids == keyframe.rig_id
+        other_view = self.kf_view_ids != keyframe.view_id
+        dists = dists + other_view * 1e6
+        n_valid = int((~same_rig).sum())
+        dists[same_rig] = float("inf")
+        indices = torch.argsort(dists)[: min(n, n_valid)].tolist()
+        return [self.keyframes[i] for i in indices]
+
     def get_Rts(self):
         invalid_ids = torch.where(~self.valid_Rt_cache)[0]
         if len(invalid_ids) > 0:
@@ -636,8 +659,11 @@ class SceneModel:
         self.optimizer.add_and_prune(self.make_dummy_ext_tensor(), valid_mask)
 
     @torch.no_grad()
-    def add_new_gaussians(self, keyframe_id: int = -1):
-        """Use the given keyframe to add new Gaussians to the scene model."""
+    def add_new_gaussians(self, keyframe_id: int = -1, prev_keyframes: list = None):
+        """
+        Use the given keyframe to add new Gaussians to the scene model.
+        prev_keyframes overrides the neighbours used for guided stereo matching.
+        """
         keyframe = self.keyframes[keyframe_id]
         ## align the keyframe's depth
         if keyframe.desc_kpts.has_pt3d.sum() == 0:
@@ -682,9 +708,12 @@ class SceneModel:
         sampled_uv = self.uv[sample_mask]
         ## Initialize positions
         # Get the samples' depth with guided stereo matching
-        prev_KFs = self.get_prev_keyframes(
-            self.guided_mvs.n_cams + 1, update_3dpts=False
-        )
+        if prev_keyframes is not None:
+            prev_KFs = list(prev_keyframes)
+        else:
+            prev_KFs = self.get_prev_keyframes(
+                self.guided_mvs.n_cams + 1, update_3dpts=False
+            )
         for i, prev_keyframe in enumerate(prev_KFs):
             if keyframe.index == prev_keyframe.index:
                 prev_KFs.pop(i)
@@ -842,6 +871,8 @@ class SceneModel:
 
         ## Add the keyframe and update the indices (sorted by distance to last keyframe)
         self.keyframes.append(keyframe)
+        self.kf_rig_ids = torch.cat([self.kf_rig_ids, torch.tensor([keyframe.rig_id], device="cuda")])
+        self.kf_view_ids = torch.cat([self.kf_view_ids, torch.tensor([keyframe.view_id], device="cuda")])
         if self.approx_cam_centres is None:
             self.approx_cam_centres = keyframe.approx_centre[None]
         else:

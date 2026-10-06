@@ -25,6 +25,12 @@ def get_args():
     parser.add_argument('--num_loader_threads', type=int, default=4,
                         help="Number of workers to load and prepare input images")
     parser.add_argument('--downsampling', type=float, default=-1.0, help="Downsampling ratio for input images")
+    parser.add_argument('--undistort', type=str, default="",
+                        help="Streams only: fisheye calibration json from scripts/calibrate_camera.py used to undistort frames. Also sets init_focal and fix_focal")
+    parser.add_argument('--undistort_fov_scale', type=float, default=1.0,
+                        help="Below 1 keeps more of the undistorted field of view but adds black borders")
+    parser.add_argument('--equirect', type=float, nargs=4, default=None, metavar=("HFOV", "VFOV", "NUM_VIEWS", "PITCH"),
+                        help="Streams only: cut a 360 equirectangular stream into a ring of NUM_VIEWS overlapping pinhole views (degrees, e.g. 100 75 6 0). Also sets init_focal and fix_focal")
     parser.add_argument('--pyr_levels', type=int, default=2,
                         help="Number of pyramid levels. Each level l will downsample the image 2^l times in width and height")
     parser.add_argument('--min_displacement', type=float, default=0.03,
@@ -133,6 +139,16 @@ def get_args():
                         help="IP address of the viewer client, if using server viewer_mode")
     parser.add_argument('--port', type=int, default=6009,
                         help="Port of the viewer client, if using server viewer_mode")
+
+    ## Unreal streaming (RobVR Gaussian Splatting plugin, network source component)
+    parser.add_argument('--unreal_stream', type=str, default="", metavar="HOST:PORT",
+                        help="Stream the active anchor to an Unreal network source component at HOST:PORT (e.g. 127.0.0.1:47800)")
+    parser.add_argument('--unreal_stream_interval', type=float, default=1.0,
+                        help="Seconds between updates sent to Unreal")
+    parser.add_argument('--unreal_unit_scale', type=float, default=100.0,
+                        help="Unreal cm per scene unit. Monocular reconstructions are not metric, so adjust to taste")
+    parser.add_argument('--unreal_min_opacity', type=float, default=0.02,
+                        help="Gaussians below this opacity are not sent")
 
     args = parser.parse_args()
 

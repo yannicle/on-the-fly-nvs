@@ -388,3 +388,107 @@ def procrustes_analysis(X0, X1, w_scale=True):  # [N,3]
     return t0[0], t1[0], s0, s1, R
 
 
+
+
+def open_webcam(index, width=1920, height=1080):
+    """Opens a USB webcam with MJPEG at the requested resolution."""
+    backend = cv2.CAP_MSMF if os.name == "nt" else cv2.CAP_ANY
+    cap = cv2.VideoCapture(index, backend)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    return cap
+
+
+def fisheye_distort(xy, K, D):
+    """Kannala-Brandt (OpenCV fisheye) projection of normalized pinhole coordinates (N, 2) to pixels."""
+    r = np.linalg.norm(xy, axis=-1, keepdims=True)
+    theta = np.arctan(r)
+    theta2 = theta ** 2
+    theta_d = theta * (1 + theta2 * (D[0] + theta2 * (D[1] + theta2 * (D[2] + theta2 * D[3]))))
+    scale = np.where(r > 1e-8, theta_d / np.maximum(r, 1e-8), 1.0)
+    xy_d = xy * scale
+    return np.stack([K[0, 0] * xy_d[:, 0] + K[0, 2], K[1, 1] * xy_d[:, 1] + K[1, 2]], -1)
+
+
+def get_undistort_maps(calib_path, width, height, fov_scale=1.0):
+    """
+    Builds remap tables from a fisheye calibration (scripts/calibrate_camera.py) to a pinhole image
+    with square pixels and a centred principal point, as the pipeline expects.
+    The focal is the smallest one for which every output pixel is valid, so there are no black borders.
+    fov_scale < 1 keeps a wider field of view at the cost of black borders.
+    Returns the two maps and the new focal in pixels.
+    """
+    import json
+    with open(calib_path) as f:
+        calib = json.load(f)
+    assert calib["model"] == "fisheye", "Only fisheye calibrations are supported"
+    K = np.array(calib["K"], dtype=np.float64)
+    D = np.array(calib["D"], dtype=np.float64).ravel()
+    # Calibration and stream resolutions may differ, intrinsics scale with the image
+    sx, sy = width / calib["width"], height / calib["height"]
+    K[0] *= sx
+    K[1] *= sy
+
+    cx, cy = (width - 1) / 2, (height - 1) / 2
+    n = 200
+    border = np.concatenate([
+        np.stack([np.linspace(0, width - 1, n), np.zeros(n)], -1),
+        np.stack([np.linspace(0, width - 1, n), np.full(n, height - 1)], -1),
+        np.stack([np.zeros(n), np.linspace(0, height - 1, n)], -1),
+        np.stack([np.full(n, width - 1), np.linspace(0, height - 1, n)], -1),
+    ])
+
+    def all_valid(focal):
+        px = fisheye_distort((border - [cx, cy]) / focal, K, D)
+        return np.all(px >= 0) and np.all(px[:, 0] <= width - 1) and np.all(px[:, 1] <= height - 1)
+
+    lo, hi = 1.0, 10 * max(K[0, 0], K[1, 1])
+    for _ in range(50):
+        mid = (lo + hi) / 2
+        lo, hi = (lo, mid) if all_valid(mid) else (mid, hi)
+    focal = hi * fov_scale
+
+    u, v = np.meshgrid(np.arange(width), np.arange(height))
+    rays = np.stack([(u - cx) / focal, (v - cy) / focal], -1).reshape(-1, 2)
+    px = fisheye_distort(rays, K, D).reshape(height, width, 2).astype(np.float32)
+    map1, map2 = cv2.convertMaps(px, None, cv2.CV_16SC2)
+    return map1, map2, focal
+
+
+def equirect_view_rotation(yaw=0.0, pitch=0.0):
+    """
+    Rotation from a virtual view's camera frame (x right, y down, z forward) to the panorama frame.
+    yaw > 0 turns the view right and pitch > 0 tilts it up, in degrees.
+    """
+    p, y = np.radians(pitch), np.radians(yaw)
+    rot_x = np.array([[1, 0, 0], [0, np.cos(p), -np.sin(p)], [0, np.sin(p), np.cos(p)]])
+    rot_y = np.array([[np.cos(y), 0, np.sin(y)], [0, 1, 0], [-np.sin(y), 0, np.cos(y)]])
+    return rot_y @ rot_x
+
+
+def get_equirect_maps(eq_width, eq_height, hfov=90.0, vfov=60.0, yaw=0.0, pitch=0.0):
+    """
+    Builds remap tables from an equirectangular (360) frame to a virtual pinhole view.
+    The focal matches the angular resolution of the panorama at the view centre, so no detail is lost there.
+    yaw > 0 turns the view right and pitch > 0 tilts it up, in degrees, from the panorama centre.
+    Returns the two maps and the focal in pixels.
+    """
+    focal = eq_width / (2 * np.pi)
+    width = int(round(2 * focal * np.tan(np.radians(hfov) / 2)))
+    height = int(round(2 * focal * np.tan(np.radians(vfov) / 2)))
+    cx, cy = (width - 1) / 2, (height - 1) / 2
+
+    u, v = np.meshgrid(np.arange(width), np.arange(height))
+    rays = np.stack([(u - cx) / focal, (v - cy) / focal, np.ones_like(u, dtype=np.float64)], -1)
+    rays = rays @ equirect_view_rotation(yaw, pitch).T
+    rays /= np.linalg.norm(rays, axis=-1, keepdims=True)
+
+    lon = np.arctan2(rays[..., 0], rays[..., 2])
+    lat = -np.arcsin(np.clip(rays[..., 1], -1, 1))
+    px = np.stack([
+        (lon / (2 * np.pi) + 0.5) * eq_width - 0.5,
+        (0.5 - lat / np.pi) * eq_height - 0.5,
+    ], -1).astype(np.float32)
+    map1, map2 = cv2.convertMaps(px, None, cv2.CV_16SC2)
+    return map1, map2, focal
