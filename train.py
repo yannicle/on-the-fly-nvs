@@ -31,7 +31,7 @@ from scene.keyframe import Keyframe
 from scene.mono_depth import MonoDepthEstimator
 from scene.scene_model import SceneModel
 from webviewer.webviewer import WebViewer
-from utils import align_mean_up_fwd, increment_runtime
+from utils import BlurDetector, align_mean_up_fwd, increment_runtime
 from unreal_stream import UnrealStreamer
 
 if __name__ == "__main__":
@@ -71,6 +71,8 @@ if __name__ == "__main__":
     depth_estimator = MonoDepthEstimator(width, height)
     scene_model = SceneModel(width, height, args, matcher)
     detector = Detector(args.num_kpts, width, height)
+    blur_detector = BlurDetector(args.blur_ratio)
+    n_blurry_skips = 0
 
     # Initialize the viewer
     if args.viewer_mode in ["server", "local"]:
@@ -190,6 +192,13 @@ if __name__ == "__main__":
             dist.median() > min_displacement
             and len(curr_prev_matches.kpts) > args.min_num_inliers
         )
+        # Wait for a sharper frame instead of adding a blurry keyframe, but not for too long to keep tracking
+        is_blurry = blur_detector(image)
+        if should_add_keyframe and is_blurry and n_blurry_skips < args.max_blurry_skips:
+            should_add_keyframe = False
+            n_blurry_skips += 1
+        elif should_add_keyframe:
+            n_blurry_skips = 0
         # Always add test frames so we estimate their poses
         should_add_keyframe |= info["is_test"]
         increment_runtime(runtimes["Load"], start_time)

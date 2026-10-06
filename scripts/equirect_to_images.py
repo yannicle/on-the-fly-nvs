@@ -29,6 +29,10 @@ if __name__ == "__main__":
     parser.add_argument("--every", type=int, default=1, help="Keep one video frame out of every N")
     parser.add_argument("--max_frames", type=int, default=-1, help="Maximum number of video frames to keep")
     args = parser.parse_args()
+    overlap = args.hfov - 360 / args.num_views
+    if overlap < 15:
+        print(f"Warning: neighbouring views only overlap by {overlap:.0f} deg. Aim for 20-40 deg, "
+              f"e.g. --hfov 100 --num_views 6 or --hfov 80 --num_views 8")
 
     cap = cv2.VideoCapture(args.input)
     if not cap.isOpened():

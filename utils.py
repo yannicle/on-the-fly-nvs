@@ -16,6 +16,7 @@ import time
 import cv2
 import torch.nn.functional as F
 import os
+from collections import deque
 
 def parse_time(seconds):
     return time.strftime("%H:%M:%S", time.gmtime(seconds))
@@ -492,3 +493,28 @@ def get_equirect_maps(eq_width, eq_height, hfov=90.0, vfov=60.0, yaw=0.0, pitch=
     ], -1).astype(np.float32)
     map1, map2 = cv2.convertMaps(px, None, cv2.CV_16SC2)
     return map1, map2, focal
+
+
+class BlurDetector:
+    """
+    Flags frames that are much blurrier than the recent ones. Sharpness is the variance of the Laplacian,
+    which depends on the scene content, so it is only compared with the median of the last frames.
+    """
+    def __init__(self, ratio: float, window: int = 30, min_history: int = 5):
+        self.ratio = ratio
+        self.min_history = min_history
+        self.history = deque(maxlen=window)
+        self.kernel = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float, device="cuda")[None, None]
+
+    def __call__(self, image: torch.Tensor) -> bool:
+        if self.ratio <= 0:
+            return False
+        # Half resolution so sensor noise does not dominate the Laplacian
+        gray = F.avg_pool2d(image.mean(0, keepdim=True)[None], 2)
+        sharpness = F.conv2d(gray, self.kernel).var().item()
+        is_blurry = (
+            len(self.history) >= self.min_history
+            and sharpness < self.ratio * float(np.median(self.history))
+        )
+        self.history.append(sharpness)
+        return is_blurry

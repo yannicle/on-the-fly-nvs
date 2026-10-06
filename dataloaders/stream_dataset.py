@@ -99,6 +99,10 @@ class StreamDataset:
         if self.undistort_maps is None:
             h, w = frame.shape[:2]
             print(f"Equirectangular stream {w}x{h}, cutting {len(yaws)} views of {hfov:.0f}x{vfov:.0f} deg")
+            overlap = hfov - 360 / num_views
+            if overlap < 15:
+                print(f"Warning: neighbouring views only overlap by {overlap:.0f} deg, Gaussians at the view borders "
+                      f"get little supervision. Aim for 20-40 deg, e.g. --equirect 100 75 6 0 or 80 75 8 0")
             self.undistort_maps = [get_equirect_maps(w, h, hfov, vfov, yaw, pitch)[:2] for yaw in yaws]
             self.focal = w / (2 * np.pi)
             if self.downsampling > 0.0:

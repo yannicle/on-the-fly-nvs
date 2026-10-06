@@ -38,6 +38,9 @@ if __name__ == "__main__":
     parser.add_argument("--extra_args", type=str, default="")
     args = parser.parse_args()
 
+    # Repetitive foliage needs more keypoints for enough correct matches, and a matching inlier threshold
+    forest_args = ["--num_kpts", "8192", "--min_num_inliers", "130"]
+
     # Set the test parameters for each scene
     all_test_params = {
         "TUM/rgbd_dataset_freiburg1_desk": {"test_hold": 30},
@@ -46,8 +49,8 @@ if __name__ == "__main__":
         "MipNerf360/garden": {"test_hold": 8},
         "MipNerf360/bonsai": {"test_hold": 8},
         "MipNerf360/counter": {"test_hold": 8},
-        "StaticHikes/forest1": {"test_hold": 10},
-        "StaticHikes/forest2": {"test_hold": 10},
+        "StaticHikes/forest1": {"test_hold": 10, "extra_args": forest_args},
+        "StaticHikes/forest2": {"test_hold": 10, "extra_args": forest_args},
         "StaticHikes/university2": {"test_hold": 10},
     }
 
@@ -76,6 +79,7 @@ if __name__ == "__main__":
                     "--model_path",
                     os.path.join(args.base_out_dir, scene),
                 ]
+                + test_params.get("extra_args", [])
                 + common_extra_args
             )
 

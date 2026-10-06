@@ -36,8 +36,13 @@ encoder = "vitl"
 
 
 class MonoDepthInternal(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, width: int, height: int):
         super(MonoDepthInternal, self).__init__()
+        # Keep the aspect ratio like Depth-Anything-V2's own preprocessing: shortest side at size, both sides multiples of 14
+        scale = size / min(width, height)
+        self.input_size = (max(round(height * scale / 14), size // 14) * 14, max(round(width * scale / 14), size // 14) * 14)
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406], device="cuda", dtype=torch.half).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225], device="cuda", dtype=torch.half).view(1, 3, 1, 1))
         model_path = f"models/depth_anything_v2_{encoder}.pth"
         if not os.path.exists(model_path):
             print(f"Downloading Depth-Anything-V2 model for {encoder}, may take a few minutes...")
@@ -90,8 +95,9 @@ class MonoDepthInternal(torch.nn.Module):
 
     def forward(self, image: torch.Tensor):
         img = torch.nn.functional.interpolate(
-            image[None].half(), (size, size), mode="bilinear", align_corners=True
+            image[None].half(), self.input_size, mode="bicubic", align_corners=True
         )
+        img = (img - self.mean) / self.std
         depth = self.model(img)[None]
         t, s = get_t_s(depth)
         depth = (depth - t) / s
@@ -148,7 +154,7 @@ class MonoDepthEstimator:
     def __init__(self, width: int, height: int):
         self.width = width
         self.height = height
-        model = MonoDepthInternal()
+        model = MonoDepthInternal(width, height)
 
         dummy = torch.zeros(3, height, width).cuda()
         self.model = torch.cuda.make_graphed_callables(model, [dummy])

@@ -35,6 +35,10 @@ def get_args():
                         help="Number of pyramid levels. Each level l will downsample the image 2^l times in width and height")
     parser.add_argument('--min_displacement', type=float, default=0.03,
                         help="Minimum median keypoint displacement for a new keyframe to be added. Relative to the image width")
+    parser.add_argument('--blur_ratio', type=float, default=0.6,
+                        help="A frame due to become a keyframe is skipped if its sharpness (variance of the Laplacian) is below blur_ratio times the median of recent frames. 0 disables")
+    parser.add_argument('--max_blurry_skips', type=int, default=5,
+                        help="Maximum number of blurry frames skipped in a row before one is accepted anyway, so tracking is not lost")
     parser.add_argument('--start_at', type=int, default=0,
                         help="Number of frames to skip from the dataset.")
     
