@@ -36,11 +36,17 @@ encoder = "vitl"
 
 
 class MonoDepthInternal(torch.nn.Module):
-    def __init__(self, width: int, height: int):
+    def __init__(self, width: int, height: int, preprocessing: str = "square"):
         super(MonoDepthInternal, self).__init__()
-        # Keep the aspect ratio like Depth-Anything-V2's own preprocessing: shortest side at size, both sides multiples of 14
-        scale = size / min(width, height)
-        self.input_size = (max(round(height * scale / 14), size // 14) * 14, max(round(width * scale / 14), size // 14) * 14)
+        # "square": the original pipeline, frames squashed to size x size without normalisation.
+        # "aspect": Depth-Anything-V2's own preprocessing, shortest side at size, both sides multiples of 14,
+        # and ImageNet normalisation. Sharper depth maps, but not better renders on StaticHikes/forest1.
+        self.preprocessing = preprocessing
+        if preprocessing == "aspect":
+            scale = size / min(width, height)
+            self.input_size = (max(round(height * scale / 14), size // 14) * 14, max(round(width * scale / 14), size // 14) * 14)
+        else:
+            self.input_size = (size, size)
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406], device="cuda", dtype=torch.half).view(1, 3, 1, 1))
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225], device="cuda", dtype=torch.half).view(1, 3, 1, 1))
         model_path = f"models/depth_anything_v2_{encoder}.pth"
@@ -94,10 +100,15 @@ class MonoDepthInternal(torch.nn.Module):
         )
 
     def forward(self, image: torch.Tensor):
-        img = torch.nn.functional.interpolate(
-            image[None].half(), self.input_size, mode="bicubic", align_corners=True
-        )
-        img = (img - self.mean) / self.std
+        if self.preprocessing == "aspect":
+            img = torch.nn.functional.interpolate(
+                image[None].half(), self.input_size, mode="bicubic", align_corners=True
+            )
+            img = (img - self.mean) / self.std
+        else:
+            img = torch.nn.functional.interpolate(
+                image[None].half(), self.input_size, mode="bilinear", align_corners=True
+            )
         depth = self.model(img)[None]
         t, s = get_t_s(depth)
         depth = (depth - t) / s
@@ -151,10 +162,10 @@ def align_depth(
 
 class MonoDepthEstimator:
     @torch.no_grad()
-    def __init__(self, width: int, height: int):
+    def __init__(self, width: int, height: int, preprocessing: str = "square"):
         self.width = width
         self.height = height
-        model = MonoDepthInternal(width, height)
+        model = MonoDepthInternal(width, height, preprocessing)
 
         dummy = torch.zeros(3, height, width).cuda()
         self.model = torch.cuda.make_graphed_callables(model, [dummy])

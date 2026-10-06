@@ -39,6 +39,8 @@ def get_args():
                         help="A frame due to become a keyframe is skipped if its sharpness (variance of the Laplacian) is below blur_ratio times the median of recent frames. 0 disables")
     parser.add_argument('--max_blurry_skips', type=int, default=5,
                         help="Maximum number of blurry frames skipped in a row before one is accepted anyway, so tracking is not lost")
+    parser.add_argument('--depth_preprocessing', choices=['square', 'aspect'], default='square',
+                        help="Mono depth input. square: frames squashed to 518x518 as in the original pipeline. aspect: keep the aspect ratio and normalise like Depth-Anything-V2, sharper depth but not better renders on StaticHikes/forest1")
     parser.add_argument('--start_at', type=int, default=0,
                         help="Number of frames to skip from the dataset.")
     

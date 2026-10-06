@@ -68,7 +68,7 @@ if __name__ == "__main__":
     )
     focal = pose_initializer.f_init
     dense_extractor = DenseExtractor(width, height)
-    depth_estimator = MonoDepthEstimator(width, height)
+    depth_estimator = MonoDepthEstimator(width, height, args.depth_preprocessing)
     scene_model = SceneModel(width, height, args, matcher)
     detector = Detector(args.num_kpts, width, height)
     blur_detector = BlurDetector(args.blur_ratio)
