@@ -466,6 +466,8 @@ if __name__ == "__main__":
                 f"\033[36mGaussians:{scene_model.n_active_gaussians}\033[0m",
                 f"\033[36mAnchors:{len(scene_model.anchors)}\033[0m",
             ]
+            if args.densify_grad_threshold > 0:
+                bar_postfix += [f"\033[36mCloned:{scene_model.n_cloned},Split:{scene_model.n_split}\033[0m"]
             pbar.set_postfix_str(",".join(bar_postfix), refresh=False)
 
     reconstruction_time = time.time() - reconstruction_start_time

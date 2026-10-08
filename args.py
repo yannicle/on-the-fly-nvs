@@ -114,6 +114,12 @@ def get_args():
     parser.add_argument('--iters_miniba_incr', type=int, default=20)
 
     ## Gaussian initialization options
+    parser.add_argument('--densify_grad_threshold', type=float, default=0.0005,
+                        help="3DGS-style densification: Gaussians whose average screen space gradient since the last keyframe exceeds this are cloned or split when the next keyframe is added. 0 disables. 3DGS uses 0.0002, which grows the scene too fast for live reconstruction")
+    parser.add_argument('--densify_split_size', type=float, default=0.01,
+                        help="Densified Gaussians larger than this fraction of the image width (in the new keyframe) are split in two, smaller ones are cloned")
+    parser.add_argument('--densify_max_ratio', type=float, default=0.03,
+                        help="At most this fraction of the Gaussians is densified per keyframe, those with the largest gradients")
     parser.add_argument('--prune_opacity', type=float, default=0.05,
                         help="Gaussians below this opacity are removed whenever a keyframe is added. Lower keeps more faint Gaussians and leaves fewer holes")
     parser.add_argument('--init_proba_scaler', type=float, default=2,

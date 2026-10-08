@@ -50,6 +50,16 @@ from utils import (
 from dataloaders.read_write_model import write_model
 
 
+def quaternion_to_matrix(q: torch.Tensor) -> torch.Tensor:
+    """Rotation matrices (N, 3, 3) from normalized (w, x, y, z) quaternions (N, 4)."""
+    w, x, y, z = q.unbind(-1)
+    return torch.stack([
+        1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+        2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+        2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y),
+    ], dim=-1).view(-1, 3, 3)
+
+
 class SceneModel:
     """
     Scene Model class that contains the scene's Gaussians, anchors, keyframes, and methods for rendering and optimization.
@@ -95,6 +105,9 @@ class SceneModel:
             self.lambda_dssim = args.lambda_dssim
             self.init_proba_scaler = args.init_proba_scaler
             self.prune_opacity = args.prune_opacity
+            self.densify_grad_threshold = args.densify_grad_threshold
+            self.densify_split_size = args.densify_split_size
+            self.densify_max_ratio = args.densify_max_ratio
             self.max_active_keyframes = args.max_active_keyframes
             self.use_last_frame_proba = args.use_last_frame_proba
             self.active_frames_cpu = []
@@ -162,6 +175,10 @@ class SceneModel:
         self.last_trained_id = 0
         # Number of keyframes added per frame, all of which count as the latest keyframes
         self.num_new_keyframes = 1
+        # Screen space gradients accumulated between keyframes for densification
+        self.densify_grad_sum = None
+        self.densify_grad_count = None
+        self.n_cloned, self.n_split = 0, 0
         self.valid_keyframes = torch.empty(0, dtype=torch.bool)
         self.lock = threading.Lock()
         self.inference_mode = inference_mode
@@ -318,6 +335,8 @@ class SceneModel:
 
         # Optimizers
         with torch.no_grad():
+            if self.densify_grad_threshold > 0 and not keyframe.info["is_test"]:
+                self.accumulate_densify_stats(render_pkg)
             # Pose optimization
             keyframe.step()
 
@@ -663,6 +682,79 @@ class SceneModel:
         self.optimizer.add_and_prune(self.make_dummy_ext_tensor(), valid_mask)
 
     @torch.no_grad()
+    def accumulate_densify_stats(self, render_pkg):
+        """Accumulates the screen space position gradient of the visible Gaussians, as in 3DGS densification."""
+        n = self.xyz.shape[0]
+        grad = render_pkg["screenspace_points"].grad
+        if grad is None or grad.shape[0] != n:
+            return
+        # The Gaussians changed since the last accumulation (added, pruned or another anchor)
+        if self.densify_grad_sum is None or self.densify_grad_sum.shape[0] != n:
+            self.densify_grad_sum = torch.zeros(n, device="cuda")
+            self.densify_grad_count = torch.zeros(n, device="cuda")
+        visible = render_pkg["visibility_filter"]
+        self.densify_grad_sum[visible] += grad[visible, :2].norm(dim=-1)
+        self.densify_grad_count[visible] += 1
+
+    @torch.no_grad()
+    def densify(self, keyframe: Keyframe):
+        """
+        Clones small and splits large Gaussians whose average screen space gradient since the last keyframe is high.
+        Size is measured as the footprint in the new keyframe, relative to the image width.
+        """
+        n = self.xyz.shape[0]
+        if (
+            self.densify_grad_threshold <= 0
+            or self.densify_grad_sum is None
+            or self.densify_grad_sum.shape[0] != n
+        ):
+            return
+        grad = self.densify_grad_sum / self.densify_grad_count.clamp_min(1)
+        self.densify_grad_sum = None
+        self.densify_grad_count = None
+        selected = grad >= self.densify_grad_threshold
+        # Keep the growth bounded so live reconstruction stays fast, favouring the largest gradients
+        max_new = int(self.densify_max_ratio * n)
+        if selected.sum() > max_new:
+            selected = torch.zeros_like(selected)
+            selected[torch.topk(grad, max_new).indices] = True
+        if not selected.any():
+            return
+
+        scaling = self.scaling
+        dist = torch.linalg.vector_norm(self.xyz - keyframe.approx_centre[None], dim=-1)
+        screen_size = self.f * scaling.max(dim=-1)[0] / dist.clamp_min(1e-6)
+        is_large = screen_size > self.densify_split_size * self.width
+        clone = selected & ~is_large
+        split = selected & is_large
+
+        params = {key: param["val"].detach() for key, param in self.gaussian_params.items()}
+        extension = {key: [val[clone]] for key, val in params.items()}
+
+        # Split: two Gaussians sampled from the original, 1.6 times smaller
+        n_split = int(split.sum())
+        if n_split > 0:
+            std = scaling[split].repeat(2, 1)
+            q = self.rotation[split].repeat(2, 1)
+            samples = torch.randn_like(std) * std
+            new_xyz = params["xyz"][split].repeat(2, 1) + torch.einsum("nij,nj->ni", quaternion_to_matrix(q), samples)
+            for key, val in params.items():
+                if key == "xyz":
+                    new_val = new_xyz
+                elif key == "scaling":
+                    new_val = val[split].repeat(2, 1) - math.log(1.6)
+                else:
+                    new_val = val[split].repeat(2, *([1] * (val.dim() - 1)))
+                extension[key].append(new_val)
+
+        self.n_cloned += int(clone.sum())
+        self.n_split += n_split
+        extension = {key: torch.cat(vals, dim=0) for key, vals in extension.items()}
+        with self.lock:
+            # The split originals are replaced by their two halves
+            self.optimizer.add_and_prune(extension, ~split)
+
+    @torch.no_grad()
     def add_new_gaussians(self, keyframe_id: int = -1, prev_keyframes: list = None):
         """
         Use the given keyframe to add new Gaussians to the scene model.
@@ -677,6 +769,9 @@ class SceneModel:
         # Skip if the keyframe is a test keyframe
         if keyframe.info["is_test"]:
             return
+
+        # Refine the existing Gaussians where training asked for more detail since the last keyframe
+        self.densify(keyframe)
 
         ## Get the pixel-wise probability to add a Gaussian
         img = keyframe.image_pyr[0]
