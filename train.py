@@ -42,7 +42,10 @@ if __name__ == "__main__":
     args = get_args()
 
     # Initialize dataloader
-    if "://" in args.source_path:
+    # Live streams train asynchronously while frames keep coming, video files are processed frame by frame
+    is_live = "://" in args.source_path
+    is_video = os.path.isfile(args.source_path) and args.source_path.lower().endswith((".mp4", ".mov", ".avi", ".mkv"))
+    if is_live or is_video:
         dataset = StreamDataset(args.source_path, args.downsampling, undistort=args.undistort,
                                 undistort_fov_scale=args.undistort_fov_scale, equirect=args.equirect)
         is_stream = True
@@ -103,18 +106,24 @@ if __name__ == "__main__":
             args.unreal_unit_scale, args.unreal_min_opacity,
         ).start()
 
-    # 360 streams: only view 0 is tracked, the other views of a frame share its centre with a fixed rotation
+    # 360 streams: the views of a frame share one centre, view 0 holds the pose and the others a fixed rotation of it.
+    # All views are used for tracking, as one direction alone can easily be textureless.
     is_rig = is_stream and args.equirect is not None and args.equirect[2] > 1
     n_mvs_cams = args.num_prev_keyframes_miniba_incr
+    # Each 360 frame adds one keyframe per view, so train proportionally more and favour all of the new views
+    n_iters_per_frame = args.num_iterations
+    if is_rig:
+        n_iters_per_frame *= int(args.equirect[2])
+        scene_model.num_new_keyframes = int(args.equirect[2])
 
-    def add_rig_views(parent, rig_views, f):
+    def add_rig_views(parent, rig_views, rig_descs, f):
         """Adds the other views of parent's 360 frame as keyframes tied to parent. Returns them."""
         keyframes = []
-        for view_id, (view_image, rig_rot) in enumerate(rig_views, 1):
+        for view_id, ((view_image, rig_rot), view_desc_kpts) in enumerate(zip(rig_views, rig_descs), 1):
             keyframe = Keyframe(
                 view_image,
-                {"is_test": False, "view_id": view_id},
-                detector(view_image),
+                {"is_test": False, "view_id": view_id, **({"name": f"{parent.info['name']}_{view_id}"} if "name" in parent.info else {})},
+                view_desc_kpts,
                 None,
                 len(scene_model.keyframes),
                 f,
@@ -134,6 +143,38 @@ if __name__ == "__main__":
         for other in scene_model.get_rig_neighbours(keyframe, n_mvs_cams):
             matcher(keyframe.desc_kpts, other.desc_kpts, remove_outliers=True, update_kpts_flag="all",
                     kID=keyframe.index, kID_other=other.index)
+
+    def track_rig(image, desc_kpts, rig_views, rig_descs, is_test):
+        """
+        Estimates the pose of every view of a 360 frame and keeps the one with the most inliers.
+        Returns view 0's pose, or None if no view could be registered.
+        """
+        base_index = len(scene_model.keyframes)
+        views = [(image, desc_kpts, None)] + [(v, d, rot) for (v, rot), d in zip(rig_views, rig_descs)]
+        best_Rt, best_inliers = None, 0
+        # Select (and re-triangulate) the neighbours of every view before matching any of them, as matches with
+        # the not yet added views would make the re-triangulation look up keyframes that do not exist
+        all_prev_keyframes = [scene_model.get_prev_keyframes(n_mvs_cams, True, d) for _, d, _ in views]
+        for k, ((view_image, view_desc_kpts, rig_rot), prev_keyframes) in enumerate(zip(views, all_prev_keyframes)):
+            # Indices match the order in which the views are added as keyframes
+            Rt = pose_initializer.initialize_incremental(
+                prev_keyframes, view_desc_kpts, base_index + k, is_test, view_image, verbose=False
+            )
+            if Rt is not None and pose_initializer.last_num_inliers > best_inliers:
+                best_inliers = pose_initializer.last_num_inliers
+                if rig_rot is not None:
+                    # Back to view 0: R_k = rot R_0 and t_k = rot t_0
+                    Rt = Rt.clone()
+                    Rt[:3, :3] = rig_rot.T @ Rt[:3, :3]
+                    Rt[:3, 3] = rig_rot.T @ Rt[:3, 3]
+                best_Rt = Rt
+        if best_Rt is None:
+            print("Too few inliers for pose initialization in every view")
+            # The frame is dropped, so its indices will be reused by the next one
+            for keyframe in scene_model.keyframes:
+                for k in range(len(views)):
+                    keyframe.desc_kpts.matches.pop(base_index + k, None)
+        return best_Rt
 
     def add_new_gaussians(keyframe):
         if is_rig:
@@ -176,21 +217,37 @@ if __name__ == "__main__":
         
         if n_keyframes == 0:
             image, info = dataset.getnext()
+            if image is None:
+                break
             prev_desc_kpts = detector(image)
+            prev_rig_descs = [detector(view) for view, _ in info.get("rig_views", [])]
+            info["rig_descs"] = prev_rig_descs
             bootstrap_keyframe_dicts = [{"image": image, "info": info}]
             bootstrap_desc_kpts = [prev_desc_kpts]
             n_keyframes += 1
             continue
 
         image, info = dataset.getnext()
+        if image is None:
+            break
         desc_kpts = detector(image)
         # Match features between the previous and current frame
         curr_prev_matches = matcher(desc_kpts, prev_desc_kpts)
         # Determine if we should add a keyframe based on the matches
         dist = torch.norm(curr_prev_matches.kpts - curr_prev_matches.kpts_other, dim=-1)
+        n_matches = len(curr_prev_matches.kpts)
+        if is_rig:
+            # Pool the matches of all views of the 360 frame
+            rig_descs = [detector(view) for view, _ in info["rig_views"]]
+            info["rig_descs"] = rig_descs
+            for view_desc_kpts, prev_view_desc_kpts in zip(rig_descs, prev_rig_descs):
+                view_matches = matcher(view_desc_kpts, prev_view_desc_kpts)
+                dist = torch.cat([dist, torch.norm(view_matches.kpts - view_matches.kpts_other, dim=-1)])
+                n_matches += len(view_matches.kpts)
         should_add_keyframe = (
-            dist.median() > min_displacement
-            and len(curr_prev_matches.kpts) > args.min_num_inliers
+            len(dist) > 0
+            and dist.median() > min_displacement
+            and n_matches > args.min_num_inliers
         )
         # Wait for a sharper frame instead of adding a blurry keyframe, but not for too long to keep tracking
         is_blurry = blur_detector(image)
@@ -220,7 +277,9 @@ if __name__ == "__main__":
                     zip(bootstrap_keyframe_dicts, bootstrap_desc_kpts, Rts)
                 ):
                     start_time = time.time()
-                    bootstrap_rig_views.append(keyframe_dict["info"].pop("rig_views", []))
+                    bootstrap_rig_views.append(
+                        (keyframe_dict["info"].pop("rig_views", []), keyframe_dict["info"].pop("rig_descs", []))
+                    )
                     if args.use_colmap_poses:
                         Rt = keyframe_dict["info"]["Rt"]
                         f = keyframe_dict["info"]["focal"]
@@ -246,8 +305,8 @@ if __name__ == "__main__":
                     # Add every rig view first so they can be matched with the views of all bootstrap frames
                     start_time = time.time()
                     rig_keyframes = []
-                    for parent, rig_views in zip(list(new_keyframes), bootstrap_rig_views):
-                        rig_keyframes += add_rig_views(parent, rig_views, f)
+                    for parent, (rig_views, rig_descs) in zip(list(new_keyframes), bootstrap_rig_views):
+                        rig_keyframes += add_rig_views(parent, rig_views, rig_descs, f)
                     for keyframe in rig_keyframes:
                         match_rig_view(keyframe)
                     new_keyframes = new_keyframes + rig_keyframes
@@ -259,10 +318,10 @@ if __name__ == "__main__":
                 start_time = time.time()
                 # Run initial optimization on the bootstrap keyframes
                 # If streaming, run async optimization until the next keyframe is added
-                if is_stream:
-                    scene_model.optimize_async(args.num_iterations)
+                if is_live:
+                    scene_model.optimize_async(n_iters_per_frame)
                 else:
-                    scene_model.optimization_loop(args.num_iterations)
+                    scene_model.optimization_loop(n_iters_per_frame)
                 increment_runtime(runtimes["Opt"], start_time)
                 last_reboot = n_keyframes
 
@@ -307,20 +366,24 @@ if __name__ == "__main__":
             # Incremental pose initialization
             if n_keyframes >= args.num_keyframes_miniba_bootstrap:
                 start_time = time.time()
-                prev_keyframes = scene_model.get_prev_keyframes(
-                    args.num_prev_keyframes_miniba_incr, True, desc_kpts
-                )
-                increment_runtime(runtimes["tri"], start_time)
-                start_time = time.time()
-                Rt = pose_initializer.initialize_incremental(
-                    prev_keyframes, desc_kpts, len(scene_model.keyframes), info["is_test"], image
-                )
+                if is_rig:
+                    Rt = track_rig(image, desc_kpts, info["rig_views"], info["rig_descs"], info["is_test"])
+                else:
+                    prev_keyframes = scene_model.get_prev_keyframes(
+                        args.num_prev_keyframes_miniba_incr, True, desc_kpts
+                    )
+                    increment_runtime(runtimes["tri"], start_time)
+                    start_time = time.time()
+                    Rt = pose_initializer.initialize_incremental(
+                        prev_keyframes, desc_kpts, len(scene_model.keyframes), info["is_test"], image
+                    )
                 increment_runtime(runtimes["BAI"], start_time)
                 start_time = time.time()
                 if Rt is not None:
                     if args.use_colmap_poses:
                         Rt = info["Rt"]
                     rig_views = info.pop("rig_views", [])
+                    rig_descs = info.pop("rig_descs", [])
                     keyframe = Keyframe(
                         image,
                         info,
@@ -337,8 +400,9 @@ if __name__ == "__main__":
                     prev_keyframe = keyframe
                     new_keyframes = [keyframe]
                     if is_rig:
-                        rig_keyframes = add_rig_views(keyframe, rig_views, f)
-                        for rig_keyframe in rig_keyframes:
+                        rig_keyframes = add_rig_views(keyframe, rig_views, rig_descs, f)
+                        # View 0 lost its matches if it was not the view the frame was registered with
+                        for rig_keyframe in [keyframe] + rig_keyframes:
                             match_rig_view(rig_keyframe)
                         new_keyframes += rig_keyframes
                     increment_runtime(runtimes["Add"], start_time)
@@ -349,10 +413,10 @@ if __name__ == "__main__":
                     increment_runtime(runtimes["Init"], start_time)
                     start_time = time.time()
                     # If streaming, run async optimization until the next keyframe is added
-                    if is_stream:
-                        scene_model.optimize_async(args.num_iterations)
+                    if is_live:
+                        scene_model.optimize_async(n_iters_per_frame)
                     else:
-                        scene_model.optimization_loop(args.num_iterations)
+                        scene_model.optimization_loop(n_iters_per_frame)
                     increment_runtime(runtimes["Opt"], start_time)
                 else:
                     should_add_keyframe = False
@@ -366,6 +430,8 @@ if __name__ == "__main__":
             n_keyframes += 1
             if not info["is_test"]:
                 prev_desc_kpts = desc_kpts
+                if is_rig:
+                    prev_rig_descs = rig_descs
 
             ## Intermediate evaluation
             if (

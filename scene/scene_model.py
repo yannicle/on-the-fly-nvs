@@ -94,6 +94,7 @@ class SceneModel:
             self.max_sh_degree = args.sh_degree
             self.lambda_dssim = args.lambda_dssim
             self.init_proba_scaler = args.init_proba_scaler
+            self.prune_opacity = args.prune_opacity
             self.max_active_keyframes = args.max_active_keyframes
             self.use_last_frame_proba = args.use_last_frame_proba
             self.active_frames_cpu = []
@@ -159,6 +160,8 @@ class SceneModel:
         self.valid_Rt_cache = torch.empty(0, device="cuda", dtype=torch.bool)
         self.sorted_frame_indices = None
         self.last_trained_id = 0
+        # Number of keyframes added per frame, all of which count as the latest keyframes
+        self.num_new_keyframes = 1
         self.valid_keyframes = torch.empty(0, dtype=torch.bool)
         self.lock = threading.Lock()
         self.inference_mode = inference_mode
@@ -268,15 +271,16 @@ class SceneModel:
         if len(self.xyz) == 0:
             return
         # Select which keyframe to train on
-        # We train on the latest keyframe with self.use_last_frame_proba probability or a random keyframe otherwise
+        # We train on one of the latest keyframes with self.use_last_frame_proba probability or a random keyframe otherwise
+        # (several latest keyframes when a frame adds several views, e.g. a 360 rig)
         if (
             np.random.rand() > self.use_last_frame_proba
-            or self.last_trained_id == -1
+            or self.last_trained_id < 0
             or finetuning
         ):
             keyframe_id = np.random.choice(self.active_frames_gpu)
         else:
-            keyframe_id = -1
+            keyframe_id = -np.random.randint(1, self.num_new_keyframes + 1)
         keyframe = self.keyframes[keyframe_id]
         lvl = keyframe.pyr_lvl
 
@@ -653,7 +657,7 @@ class SceneModel:
 
     def reset(self, keyframe_id: int = -1):
         """Remove the Gaussians that are visible in the given keyframe."""
-        valid_mask = self.opacity[:, 0] > 0.05
+        valid_mask = self.opacity[:, 0] > self.prune_opacity
         render_pkg = self.render_from_id(keyframe_id)
         valid_mask[render_pkg["visibility_filter"]] = False
         self.optimizer.add_and_prune(self.make_dummy_ext_tensor(), valid_mask)
@@ -814,7 +818,7 @@ class SceneModel:
         ## Get which Gaussians should be pruned
         if self.xyz.shape[0] > 0:
             # Only keep Gaussians with non neglectible opacity
-            valid_gs_mask = self.opacity[:, 0] > 0.05
+            valid_gs_mask = self.opacity[:, 0] > self.prune_opacity
 
             # Discard huge Gaussians
             dist = torch.linalg.vector_norm(

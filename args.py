@@ -30,7 +30,7 @@ def get_args():
     parser.add_argument('--undistort_fov_scale', type=float, default=1.0,
                         help="Below 1 keeps more of the undistorted field of view but adds black borders")
     parser.add_argument('--equirect', type=float, nargs=4, default=None, metavar=("HFOV", "VFOV", "NUM_VIEWS", "PITCH"),
-                        help="Streams only: cut a 360 equirectangular stream into a ring of NUM_VIEWS overlapping pinhole views (degrees, e.g. 100 75 6 0). Also sets init_focal and fix_focal")
+                        help="Streams and video files only: cut a 360 equirectangular stream into a ring of NUM_VIEWS overlapping pinhole views (degrees, e.g. 100 75 6 0). Also sets init_focal and fix_focal")
     parser.add_argument('--pyr_levels', type=int, default=2,
                         help="Number of pyramid levels. Each level l will downsample the image 2^l times in width and height")
     parser.add_argument('--min_displacement', type=float, default=0.03,
@@ -114,6 +114,8 @@ def get_args():
     parser.add_argument('--iters_miniba_incr', type=int, default=20)
 
     ## Gaussian initialization options
+    parser.add_argument('--prune_opacity', type=float, default=0.05,
+                        help="Gaussians below this opacity are removed whenever a keyframe is added. Lower keeps more faint Gaussians and leaves fewer holes")
     parser.add_argument('--init_proba_scaler', type=float, default=2,
                         help="Scale the laplacian-based probability of using a pixel to make a new Gaussian primitive. Set to 0 to only use triangulated points.")
 

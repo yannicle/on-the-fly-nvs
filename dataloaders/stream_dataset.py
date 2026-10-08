@@ -10,6 +10,7 @@
 #
 
 import argparse
+import os
 import queue
 import time
 from threading import Thread
@@ -27,7 +28,8 @@ class StreamDataset:
                  undistort: str = "", undistort_fov_scale: float = 1.0, equirect: tuple = None):
         """
         Args:
-            video_url (str): video stream URL, or webcam://<index> for a local USB webcam.
+            video_url (str): video stream URL, webcam://<index> for a local USB webcam, or a video file.
+                Video files are read frame by frame without dropping any, and getnext returns (None, None) at the end.
             retry_delay (int): Delay in seconds between retries.
             undistort (str): optional fisheye calibration json (scripts/calibrate_camera.py) used to undistort frames.
             undistort_fov_scale (float): < 1 keeps more of the field of view but adds black borders.
@@ -43,7 +45,15 @@ class StreamDataset:
         self.undistort_maps = None
         self.focal = None
 
-        self.frame_queue = queue.Queue(maxsize=1)
+        self.is_file = os.path.isfile(video_url)
+        self.length = 100_000_000  # Arbitrary large number as we don't know the length of a stream
+        if self.is_file:
+            cap = cv2.VideoCapture(video_url)
+            self.length = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+        self.peeked = None
+
+        self.frame_queue = queue.Queue(maxsize=8 if self.is_file else 1)
         self.running = True
         self.retry_delay = retry_delay
         self.cap = None
@@ -79,6 +89,12 @@ class StreamDataset:
                 continue
 
             ret, frame = self.cap.read()
+            if self.is_file:
+                # Keep every frame and stop at the end of the file
+                self.frame_queue.put(frame if ret else None)
+                if not ret:
+                    break
+                continue
             if not ret:
                 print("Failed to read frame from stream.")
                 self.cap.release()
@@ -126,10 +142,18 @@ class StreamDataset:
         return torch.from_numpy(frame).permute(2, 0, 1).cuda().float() / 255.0
 
     def getnext(self) -> tuple[Tensor, dict]:
+        if self.peeked is not None:
+            image_info, self.peeked = self.peeked, None
+            return image_info
         frame = self.frame_queue.get(block=True)
+        if frame is None:
+            return None, None
         self.num_frames += 1
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         info = {"is_test": False}
+        if self.is_file:
+            # Frame number in the video, saved with the keyframes
+            info["name"] = f"{self.num_frames - 1:06d}"
         if self.equirect:
             # View 0 is tracked, the other views share its centre with a fixed rotation
             views, rotations = self._equirect_views(frame)
@@ -147,9 +171,9 @@ class StreamDataset:
         return self._to_tensor(frame), info
 
     def get_image_size(self):
-        frame = self.getnext()[0]
-        self.num_frames -= 1
-        return frame.shape[-2], frame.shape[-1]
+        # Keep the frame so it is still returned by the next getnext
+        self.peeked = self.getnext()
+        return self.peeked[0].shape[-2], self.peeked[0].shape[-1]
 
     def stop(self) -> None:
         self.running = False
@@ -157,8 +181,7 @@ class StreamDataset:
         self.capture_thd.join()
     
     def __len__(self):
-        # Arbitrary large number as we don't know the length of a stream
-        return 100_000_000  
+        return self.length
 
 # Example usage
 if __name__ == "__main__":

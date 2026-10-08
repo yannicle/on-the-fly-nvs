@@ -184,9 +184,10 @@ class PoseInitializer():
         return Rts, f, final_residual
 
     @torch.no_grad()
-    def initialize_incremental(self, keyframes: list[Keyframe], curr_desc_kpts: DescribedKeypoints, index: int, is_test: bool, curr_img):
+    def initialize_incremental(self, keyframes: list[Keyframe], curr_desc_kpts: DescribedKeypoints, index: int, is_test: bool, curr_img, verbose: bool = True):
         """
         Initialize the pose of the frame given by curr_desc_kpts and index using the previously registered keyframes.
+        The number of inliers of the last call is kept in self.last_num_inliers.
         """
         
         # Match the current frame with previous keyframes
@@ -215,6 +216,15 @@ class PoseInitializer():
             uvs = uvs[selected_indices]
             confs = confs[selected_indices]
             match_indices = match_indices[selected_indices]
+
+        # Too few 2D-3D matches to reach min_num_inliers, or even to sample PnP (e.g. a textureless view of a 360 rig)
+        if len(xyz) < 4 or (not is_test and len(xyz) <= self.min_num_inliers):
+            self.last_num_inliers = 0
+            if verbose:
+                print("Too few inliers for pose initialization")
+            for keyframe in keyframes:
+                keyframe.desc_kpts.matches.pop(index, None)
+            return None
 
         # Estimate an initial camera pose and inliers using PnP RANSAC
         # Read the pose through get_Rt, as rig views have no pose parameters of their own
@@ -245,11 +255,13 @@ class PoseInitializer():
         Rt[:3, 3] = ts[0]
 
         # Check if we have sufficiently many inliers
+        self.last_num_inliers = int(mask.sum())
         if is_test or mask.sum() > self.min_num_inliers:
             # Return the pose of the current frame
             return Rt
         else:
-            print("Too few inliers for pose initialization")
+            if verbose:
+                print("Too few inliers for pose initialization")
             # Remove matches as we prevent the current frame from being registered
             for keyframe in keyframes:
                 keyframe.desc_kpts.matches.pop(index, None)
